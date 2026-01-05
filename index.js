@@ -76,7 +76,7 @@ app.post('/cancel', async (req, res) => {
 
       const PAGES_PER_BATCH = 10;
       const ITEMS_PER_PAGE = 100;
-      const MAX_BATCHES = 5;
+      const MAX_BATCHES = 20;  // Search up to 20,000 clients
 
       for (let batch = 0; batch < MAX_BATCHES && !foundClientId; batch++) {
         const startPage = batch * PAGES_PER_BATCH + 1;
@@ -86,7 +86,7 @@ app.post('/cancel', async (req, res) => {
           const page = startPage + i;
           pagePromises.push(
             axios.get(
-              `${CONFIG.API_URL}/clients?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}&PageNumber=${page}&ItemsPerPage=${ITEMS_PER_PAGE}`,
+              `${CONFIG.API_URL}/clients?tenantid=${CONFIG.TENANT_ID}&locationid=${CONFIG.LOCATION_ID}&PageNumber=${page}&ItemsPerPage=${ITEMS_PER_PAGE}`,
               { headers: { Authorization: `Bearer ${authToken}` } }
             ).catch(() => ({ data: { data: [] } }))
           );
