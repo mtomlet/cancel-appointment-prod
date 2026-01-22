@@ -194,67 +194,114 @@ app.post('/cancel', async (req, res) => {
     let serviceId = appointment_service_id;
     let concurrencyDigits = concurrency_check;
 
-    // FAST PATH: If appointment_service_id is provided, use it directly
-    if (serviceId) {
+    // FAST PATH: If appointment_service_id is provided WITH phone, find client first then match appointment
+    if (serviceId && phone && !concurrencyDigits) {
       console.log('PRODUCTION: Using provided appointment_service_id:', serviceId);
+      console.log('PRODUCTION: Finding client by phone first (fast path)...');
 
-      // If concurrency_check not provided, we need to look it up
-      if (!concurrencyDigits) {
-        console.log('PRODUCTION: Looking up concurrency_check for appointment...');
-        // We need to find this appointment to get concurrency digits
-        // Search through all clients' appointments to find this one
-        const PAGES_PER_BATCH = 10;
-        const MAX_BATCHES = 20;
-        let found = false;
+      const cleanPhone = normalizePhone(phone);
+      let foundClient = null;
 
-        for (let batch = 0; batch < MAX_BATCHES && !found; batch++) {
-          const startPage = batch * PAGES_PER_BATCH + 1;
-          const pagePromises = [];
+      // Find client by phone (fast - parallel pagination)
+      const PAGES_PER_BATCH = 10;
+      const MAX_BATCHES = 20;
 
-          for (let i = 0; i < PAGES_PER_BATCH; i++) {
-            const page = startPage + i;
-            pagePromises.push(
-              axios.get(
-                `${CONFIG.API_URL}/clients?tenantid=${CONFIG.TENANT_ID}&locationid=${CONFIG.LOCATION_ID}&PageNumber=${page}&ItemsPerPage=100`,
-                { headers: { Authorization: `Bearer ${authToken}` }, timeout: 3000 }
-              ).catch(() => ({ data: { data: [] } }))
-            );
-          }
+      for (let batch = 0; batch < MAX_BATCHES && !foundClient; batch++) {
+        const startPage = batch * PAGES_PER_BATCH + 1;
+        const pagePromises = [];
 
-          const results = await Promise.all(pagePromises);
-
-          for (const result of results) {
-            const clients = result.data?.data || [];
-            for (const client of clients) {
-              try {
-                const apptRes = await axios.get(
-                  `${CONFIG.API_URL}/book/client/${client.clientId}/services?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
-                  { headers: { Authorization: `Bearer ${authToken}` }, timeout: 3000 }
-                );
-                const appointments = apptRes.data?.data || apptRes.data || [];
-                const match = appointments.find(a => a.appointmentServiceId === serviceId);
-                if (match) {
-                  concurrencyDigits = match.concurrencyCheckDigits;
-                  console.log('PRODUCTION: Found concurrency_check:', concurrencyDigits);
-                  found = true;
-                  break;
-                }
-              } catch (e) {
-                // Skip this client
-              }
-            }
-            if (found) break;
-          }
+        for (let i = 0; i < PAGES_PER_BATCH; i++) {
+          const page = startPage + i;
+          pagePromises.push(
+            axios.get(
+              `${CONFIG.API_URL}/clients?tenantid=${CONFIG.TENANT_ID}&locationid=${CONFIG.LOCATION_ID}&PageNumber=${page}&ItemsPerPage=100`,
+              { headers: { Authorization: `Bearer ${authToken}` }, timeout: 3000 }
+            ).catch(() => ({ data: { data: [] } }))
+          );
         }
 
-        if (!concurrencyDigits) {
-          return res.json({
-            success: false,
-            error: 'Could not find appointment with that ID'
-          });
+        const results = await Promise.all(pagePromises);
+        let emptyPages = 0;
+
+        for (const result of results) {
+          const clients = result.data?.data || [];
+          if (clients.length === 0) emptyPages++;
+
+          for (const c of clients) {
+            const clientPhone = normalizePhone(c.primaryPhoneNumber);
+            if (clientPhone === cleanPhone) {
+              foundClient = c;
+              break;
+            }
+          }
+          if (foundClient) break;
+        }
+
+        if (emptyPages === PAGES_PER_BATCH) break;
+      }
+
+      if (!foundClient) {
+        return res.json({
+          success: false,
+          error: 'No client found with that phone number'
+        });
+      }
+
+      // First check main client's appointments (fast)
+      let found = false;
+      console.log('PRODUCTION: Checking main client appointments first');
+
+      try {
+        const apptRes = await axios.get(
+          `${CONFIG.API_URL}/book/client/${foundClient.clientId}/services?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
+          { headers: { Authorization: `Bearer ${authToken}` }, timeout: 5000 }
+        );
+        const appointments = apptRes.data?.data || apptRes.data || [];
+        const match = appointments.find(a => a.appointmentServiceId === serviceId);
+        if (match) {
+          concurrencyDigits = match.concurrencyCheckDigits;
+          console.log('PRODUCTION: Found concurrency_check:', concurrencyDigits, 'for main client', foundClient.firstName, foundClient.lastName);
+          found = true;
+        }
+      } catch (e) {
+        console.log('Error checking main client appointments:', e.message);
+      }
+
+      // Only search linked profiles if not found for main client
+      if (!found) {
+        console.log('PRODUCTION: Not found for main client, checking linked profiles...');
+        const linkedProfiles = await findLinkedProfiles(authToken, foundClient.clientId, CONFIG.LOCATION_ID);
+
+        for (const profile of linkedProfiles) {
+          try {
+            const apptRes = await axios.get(
+              `${CONFIG.API_URL}/book/client/${profile.client_id}/services?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
+              { headers: { Authorization: `Bearer ${authToken}` }, timeout: 5000 }
+            );
+            const appointments = apptRes.data?.data || apptRes.data || [];
+            const match = appointments.find(a => a.appointmentServiceId === serviceId);
+            if (match) {
+              concurrencyDigits = match.concurrencyCheckDigits;
+              console.log('PRODUCTION: Found concurrency_check:', concurrencyDigits, 'for linked profile', profile.first_name, profile.last_name);
+              found = true;
+              break;
+            }
+          } catch (e) {
+            console.log('Error checking appointments for', profile.first_name, ':', e.message);
+          }
         }
       }
-    } else {
+
+      if (!found) {
+        return res.json({
+          success: false,
+          error: 'Could not find appointment with that ID for this caller'
+        });
+      }
+    } else if (serviceId && concurrencyDigits) {
+      // Already have everything we need - skip lookup
+      console.log('PRODUCTION: Using provided appointment_service_id and concurrency_check');
+    } else if (!serviceId) {
       // Step 1: Find client with parallel pagination
       const cleanPhone = phone ? normalizePhone(phone) : null;
       const cleanEmail = email?.toLowerCase();
