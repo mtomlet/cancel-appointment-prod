@@ -180,6 +180,8 @@ app.post('/cancel', async (req, res) => {
   try {
     const { phone, email, appointment_service_id, concurrency_check } = req.body;
 
+    console.log('PRODUCTION Cancel request:', JSON.stringify(req.body));
+
     if (!appointment_service_id && !phone && !email) {
       return res.json({
         success: false,
@@ -192,8 +194,67 @@ app.post('/cancel', async (req, res) => {
     let serviceId = appointment_service_id;
     let concurrencyDigits = concurrency_check;
 
-    // If phone/email provided, lookup the appointment with pagination
-    if (!serviceId) {
+    // FAST PATH: If appointment_service_id is provided, use it directly
+    if (serviceId) {
+      console.log('PRODUCTION: Using provided appointment_service_id:', serviceId);
+
+      // If concurrency_check not provided, we need to look it up
+      if (!concurrencyDigits) {
+        console.log('PRODUCTION: Looking up concurrency_check for appointment...');
+        // We need to find this appointment to get concurrency digits
+        // Search through all clients' appointments to find this one
+        const PAGES_PER_BATCH = 10;
+        const MAX_BATCHES = 20;
+        let found = false;
+
+        for (let batch = 0; batch < MAX_BATCHES && !found; batch++) {
+          const startPage = batch * PAGES_PER_BATCH + 1;
+          const pagePromises = [];
+
+          for (let i = 0; i < PAGES_PER_BATCH; i++) {
+            const page = startPage + i;
+            pagePromises.push(
+              axios.get(
+                `${CONFIG.API_URL}/clients?tenantid=${CONFIG.TENANT_ID}&locationid=${CONFIG.LOCATION_ID}&PageNumber=${page}&ItemsPerPage=100`,
+                { headers: { Authorization: `Bearer ${authToken}` }, timeout: 3000 }
+              ).catch(() => ({ data: { data: [] } }))
+            );
+          }
+
+          const results = await Promise.all(pagePromises);
+
+          for (const result of results) {
+            const clients = result.data?.data || [];
+            for (const client of clients) {
+              try {
+                const apptRes = await axios.get(
+                  `${CONFIG.API_URL}/book/client/${client.clientId}/services?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
+                  { headers: { Authorization: `Bearer ${authToken}` }, timeout: 3000 }
+                );
+                const appointments = apptRes.data?.data || apptRes.data || [];
+                const match = appointments.find(a => a.appointmentServiceId === serviceId);
+                if (match) {
+                  concurrencyDigits = match.concurrencyCheckDigits;
+                  console.log('PRODUCTION: Found concurrency_check:', concurrencyDigits);
+                  found = true;
+                  break;
+                }
+              } catch (e) {
+                // Skip this client
+              }
+            }
+            if (found) break;
+          }
+        }
+
+        if (!concurrencyDigits) {
+          return res.json({
+            success: false,
+            error: 'Could not find appointment with that ID'
+          });
+        }
+      }
+    } else {
       // Step 1: Find client with parallel pagination
       const cleanPhone = phone ? normalizePhone(phone) : null;
       const cleanEmail = email?.toLowerCase();
@@ -292,9 +353,9 @@ app.post('/cancel', async (req, res) => {
       concurrencyDigits = nextAppt.concurrency_check;
 
       console.log('PRODUCTION: Found appointment to cancel:', serviceId, 'for', nextAppt.client_name, 'at', nextAppt.datetime);
-    }
+    } // End of phone/email lookup block
 
-    // Step 3: Cancel the appointment
+    // Cancel the appointment
     const cancelRes = await axios.delete(
       `${CONFIG.API_URL}/book/service/${serviceId}?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}&ConcurrencyCheckDigits=${concurrencyDigits}`,
       { headers: { Authorization: `Bearer ${authToken}` }}
